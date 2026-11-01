@@ -479,6 +479,7 @@ if uploaded:
         st.session_state.processed = None
         st.session_state.pop("tool_names", None)
         st.session_state.pop("names_for", None)
+        st.session_state.pop("rejected", None)
 
     st.write("Selected Image")
     st.image(
@@ -636,6 +637,8 @@ if uploaded:
                     for contour in raw_contours
                 ]
 
+                st.session_state.pop("rejected", None)
+
                 st.session_state.processed.update({
                     "contours": contours,
                     "min_area": int(min_area),
@@ -680,16 +683,16 @@ if uploaded:
                     ]
                     st.session_state.names_for = current_id
 
+                # Indices of tools the user has rejected with the X button.
+                rejected = st.session_state.setdefault("rejected", set())
+                kept = [i for i in range(len(contours)) if i not in rejected]
+
                 # Display the labelled image before asking the user to name
                 # each detected tool.
-                preview_names = [
-                    f"Tool_{index + 1}"
-                    for index in range(len(contours))
-                ]
                 preview = annotate_image(
                     corrected,
-                    contours,
-                    preview_names
+                    [contours[i] for i in kept],
+                    [f"Tool_{i + 1}" for i in kept]
                 )
 
                 st.subheader("Labelled image")
@@ -705,24 +708,40 @@ if uploaded:
                 st.subheader("Name your tools")
                 naming_columns = st.columns(2)
 
-                for index in range(len(contours)):
+                for index in kept:
                     with naming_columns[index % 2]:
-                        st.session_state.tool_names[index] = st.text_input(
-                            f"Tool {index + 1}",
-                            value=st.session_state.tool_names[index],
-                            key=f"name_{current_id}_{index}"
+                        name_col, x_col = st.columns(
+                            [6, 1],
+                            vertical_alignment="bottom"
                         )
 
+                        with name_col:
+                            st.session_state.tool_names[index] = st.text_input(
+                                f"Tool {index + 1}",
+                                value=st.session_state.tool_names[index],
+                                key=f"name_{current_id}_{index}"
+                            )
+
+                        with x_col:
+                            st.button(
+                                "❌",
+                                key=f"reject_{current_id}_{index}",
+                                help="Remove this outline",
+                                on_click=rejected.add,
+                                args=(index,)
+                            )
+
                 names = [
-                    name.strip() or f"Tool_{index + 1}"
-                    for index, name in enumerate(st.session_state.tool_names)
+                    st.session_state.tool_names[i].strip() or f"Tool_{i + 1}"
+                    for i in kept
                 ]
+                kept_contours = [contours[i] for i in kept]
 
                 # Refresh the labels using the names entered above. This
                 # remains the image used for the final download.
                 preview = annotate_image(
                     corrected,
-                    contours,
+                    kept_contours,
                     names
                 )
 
@@ -733,7 +752,7 @@ if uploaded:
                 with col1:
                     st.download_button(
                         "Download combined DXF",
-                        data=make_dxf(contours, names, scale),
+                        data=make_dxf(kept_contours, names, scale),
                         file_name=f"{image_name}_entire_bed.dxf",
                         mime="application/dxf",
                         use_container_width=True
@@ -742,7 +761,7 @@ if uploaded:
                 with col2:
                     st.download_button(
                         "Download individual DXFs (ZIP)",
-                        data=make_zip(contours, names, scale),
+                        data=make_zip(kept_contours, names, scale),
                         file_name=f"{image_name}_individual_tools.zip",
                         mime="application/zip",
                         use_container_width=True
