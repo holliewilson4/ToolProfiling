@@ -677,10 +677,8 @@ if uploaded:
                     or st.session_state.get("names_for") != current_id
                     or len(st.session_state.tool_names) != len(contours)
                 ):
-                    st.session_state.tool_names = [
-                        f"Tool_{index + 1}"
-                        for index in range(len(contours))
-                    ]
+                    # None means "use the default name for its position".
+                    st.session_state.tool_names = [None] * len(contours)
                     st.session_state.names_for = current_id
 
                 # Indices of tools the user has rejected with the X button.
@@ -692,7 +690,7 @@ if uploaded:
                 preview = annotate_image(
                     corrected,
                     [contours[i] for i in kept],
-                    [f"Tool_{i + 1}" for i in kept]
+                    [f"Tool_{pos + 1}" for pos in range(len(kept))]
                 )
 
                 st.subheader("Labelled image")
@@ -708,18 +706,26 @@ if uploaded:
                 st.subheader("Name your tools")
                 naming_columns = st.columns(2)
 
-                for index in kept:
-                    with naming_columns[index % 2]:
+                for position, index in enumerate(kept):
+                    default_name = f"Tool_{position + 1}"
+
+                    with naming_columns[position % 2]:
                         name_col, x_col = st.columns(
                             [6, 1],
                             vertical_alignment="bottom"
                         )
 
                         with name_col:
-                            st.session_state.tool_names[index] = st.text_input(
-                                f"Tool {index + 1}",
-                                value=st.session_state.tool_names[index],
-                                key=f"name_{current_id}_{index}"
+                            entered = st.text_input(
+                                f"Tool {position + 1}",
+                                value=st.session_state.tool_names[index] or default_name,
+                                key=f"name_{current_id}_{index}_{position}"
+                            )
+
+                            # Only keep names the user actually changed, so
+                            # untouched tools renumber when one is removed.
+                            st.session_state.tool_names[index] = (
+                                None if entered == default_name else entered
                             )
 
                         with x_col:
@@ -732,8 +738,9 @@ if uploaded:
                             )
 
                 names = [
-                    st.session_state.tool_names[i].strip() or f"Tool_{i + 1}"
-                    for i in kept
+                    (st.session_state.tool_names[i] or "").strip()
+                    or f"Tool_{position + 1}"
+                    for position, i in enumerate(kept)
                 ]
                 kept_contours = [contours[i] for i in kept]
 
