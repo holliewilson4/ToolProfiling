@@ -37,7 +37,7 @@ LIGHTBED_PREVIEW_HEIGHT = 560
 # CAMERA_INDEX is the camera device number, NOT a folder/file path.
 # Usually 0 = first camera, 1 = second camera, 2 = third camera, etc.
 # If the laptop's built-in webcam is index 0, the ELP camera may be index 1.
-CAMERA_INDEX = 0  # EDIT THIS VALUE if the ELP camera is a different index.
+CAMERA_INDEX = 1  # EDIT THIS VALUE if the ELP camera is a different index.
 
 # These are the requested still-image dimensions for the ELP 16MP camera.
 # The camera/driver may choose a different supported resolution; the app
