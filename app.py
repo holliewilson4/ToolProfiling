@@ -1,4 +1,6 @@
 import io
+import os
+import uuid
 import zipfile
 from pathlib import Path
 
@@ -17,7 +19,8 @@ st.set_page_config(page_title="Tool Profiling", page_icon="🛠️", layout="wid
 
 st.title("🛠️ Tool Profiling")
 st.caption(
-    "Upload a shadowbox image to generate individual tool DXFs. "
+    "Capture a shadowbox photograph using a connected USB camera, or upload an image, "
+    "to generate individual tool DXFs."
 )
 
 MIN_CONTOUR_AREA = 2500
@@ -27,6 +30,23 @@ UPLOAD_PREVIEW_WIDTH = 560
 UPLOAD_PREVIEW_HEIGHT = 360
 LIGHTBED_PREVIEW_WIDTH = 760
 LIGHTBED_PREVIEW_HEIGHT = 560
+
+# ------------------------------------------------------------
+# USB CAMERA SETTINGS — EDIT THESE IF YOUR CAMERA IS NOT FOUND
+# ------------------------------------------------------------
+# CAMERA_INDEX is the camera device number, NOT a folder/file path.
+# Usually 0 = first camera, 1 = second camera, 2 = third camera, etc.
+# If the laptop's built-in webcam is index 0, the ELP camera may be index 1.
+CAMERA_INDEX = 0  # EDIT THIS VALUE if the ELP camera is a different index.
+
+# These are the requested still-image dimensions for the ELP 16MP camera.
+# The camera/driver may choose a different supported resolution; the app
+# reports the actual resolution when the camera starts.
+CAMERA_REQUESTED_WIDTH = 4656
+CAMERA_REQUESTED_HEIGHT = 3496
+CAMERA_PREVIEW_WIDTH = 760
+CAMERA_PREVIEW_HEIGHT = 520
+CAMERA_REFRESH_MS = 250
 
 # The corrected image is generated at this resolution.
 # DXF dimensions are still exported in millimetres.
@@ -62,6 +82,78 @@ def display_sized(image, max_width=DISPLAY_MAX_WIDTH, max_height=DISPLAY_MAX_HEI
 
     rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
     return Image.fromarray(rgb)
+
+
+def open_usb_camera(camera_index=CAMERA_INDEX):
+    """Open the locally connected USB camera using its OpenCV device index."""
+    if os.name == "nt":
+        # DirectShow is generally a useful backend for USB UVC cameras on Windows.
+        camera = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+    else:
+        camera = cv2.VideoCapture(camera_index)
+
+    if not camera.isOpened():
+        camera.release()
+        raise RuntimeError(
+            f"Could not open camera index {camera_index}. "
+            "Check the USB connection and try another CAMERA_INDEX value."
+        )
+
+    # Request MJPEG, which is commonly used by high-resolution USB cameras.
+    camera.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    camera.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_REQUESTED_WIDTH)
+    camera.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_REQUESTED_HEIGHT)
+    camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+    return camera
+
+
+def release_usb_camera():
+    """Safely release the camera when stopping preview or changing source."""
+    camera = st.session_state.get("usb_camera")
+    if camera is not None:
+        camera.release()
+    st.session_state.usb_camera = None
+
+
+@st.fragment(run_every=f"{CAMERA_REFRESH_MS}ms")
+def live_camera_preview():
+    """Refresh the live USB-camera preview without rerunning the whole app."""
+    camera = st.session_state.get("usb_camera")
+    if camera is None or not camera.isOpened():
+        st.warning("The camera is not currently connected.")
+        return
+
+    success, frame = camera.read()
+    if not success or frame is None:
+        st.warning("The camera is connected, but no image frame was received.")
+        return
+
+    # Use the actual returned frame dimensions rather than assuming the
+    # camera accepted the requested 16MP setting.
+    actual_height, actual_width = frame.shape[:2]
+    st.image(
+        display_sized(
+            frame,
+            max_width=CAMERA_PREVIEW_WIDTH,
+            max_height=CAMERA_PREVIEW_HEIGHT
+        ),
+        caption=f"Live camera preview — {actual_width} × {actual_height} pixels",
+        width=CAMERA_PREVIEW_WIDTH
+    )
+    if (actual_width, actual_height) != (CAMERA_REQUESTED_WIDTH, CAMERA_REQUESTED_HEIGHT):
+        st.caption(
+            "The camera is currently providing a different resolution from the "
+            "requested 16MP mode. Check the camera's supported modes/driver if "
+            "full-resolution capture is required."
+        )
+
+    if st.button("Capture photograph", type="primary", key="capture_usb_camera"):
+        # Store the full-resolution BGR frame, not the smaller preview image.
+        st.session_state.captured_camera_image = frame.copy()
+        st.session_state.captured_camera_id = uuid.uuid4().hex[:12]
+        release_usb_camera()
+        st.rerun(scope="app")
 
 
 # ------------------------------------------------------------
@@ -345,6 +437,70 @@ def simplify_contour(contour, factor):
     return cv2.approxPolyDP(contour, epsilon, True)
 
 
+def offset_contour(contour, offset_mm, scale_mm_per_pixel):
+    """
+    Expand or contract one tool contour by the requested distance in mm.
+    Positive values expand outwards; negative values contract inwards.
+    Supersampling gives the offset finer resolution than the working image.
+    """
+    if abs(offset_mm) < 1e-9:
+        return contour.copy()
+
+    supersample = 4
+    radius_px = int(round(
+        abs(float(offset_mm)) / scale_mm_per_pixel * supersample
+    ))
+    if radius_px == 0:
+        return contour.copy()
+
+    x, y, width, height = cv2.boundingRect(contour)
+    padding = radius_px + 3 * supersample
+
+    mask = np.zeros(
+        (
+            height * supersample + 2 * padding,
+            width * supersample + 2 * padding
+        ),
+        dtype=np.uint8
+    )
+
+    shifted_contour = np.rint(
+        (contour.astype(np.float32) - np.array([[[x, y]]], dtype=np.float32))
+        * supersample
+    ).astype(np.int32)
+    shifted_contour[:, 0, 0] += padding
+    shifted_contour[:, 0, 1] += padding
+    cv2.drawContours(mask, [shifted_contour], -1, 255, thickness=cv2.FILLED)
+
+    kernel_size = 2 * radius_px + 1
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (kernel_size, kernel_size)
+    )
+
+    if offset_mm > 0:
+        adjusted_mask = cv2.dilate(mask, kernel, iterations=1)
+    else:
+        adjusted_mask = cv2.erode(mask, kernel, iterations=1)
+
+    adjusted_contours, _ = cv2.findContours(
+        adjusted_mask,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    if not adjusted_contours:
+        return contour.copy()
+
+    # Retain the largest resulting outline if a large inward offset
+    # causes a narrow section of the shape to separate.
+    adjusted = max(adjusted_contours, key=cv2.contourArea).astype(np.float32)
+    adjusted[:, 0, 0] = adjusted[:, 0, 0] / supersample + x - padding / supersample
+    adjusted[:, 0, 1] = adjusted[:, 0, 1] / supersample + y - padding / supersample
+
+    return adjusted
+
+
 # ------------------------------------------------------------
 # DXF and ZIP export
 # ------------------------------------------------------------
@@ -419,7 +575,7 @@ def annotate_image(corrected, contours, names):
     for contour, name in zip(contours, names):
         cv2.drawContours(
             output,
-            [contour],
+            [np.rint(contour).astype(np.int32)],
             -1,
             (0, 0, 255),
             3
@@ -441,6 +597,18 @@ def annotate_image(corrected, contours, names):
     return output
 
 
+def reject_detected_tool(index):
+    rejected = set(st.session_state.get("rejected_tools", set()))
+    rejected.add(index)
+    st.session_state.rejected_tools = rejected
+
+
+def restore_detected_tool(index):
+    rejected = set(st.session_state.get("rejected_tools", set()))
+    rejected.discard(index)
+    st.session_state.rejected_tools = rejected
+
+
 # ------------------------------------------------------------
 # Session state
 # ------------------------------------------------------------
@@ -451,6 +619,15 @@ if "processed" not in st.session_state:
 if "upload_id" not in st.session_state:
     st.session_state.upload_id = None
 
+if "usb_camera" not in st.session_state:
+    st.session_state.usb_camera = None
+
+if "captured_camera_image" not in st.session_state:
+    st.session_state.captured_camera_image = None
+
+if "captured_camera_id" not in st.session_state:
+    st.session_state.captured_camera_id = None
+
 
 # ------------------------------------------------------------
 # User interface
@@ -458,28 +635,86 @@ if "upload_id" not in st.session_state:
 
 
 
-st.subheader("1. Upload your shadowbox image")
+st.subheader("1. Capture or upload your shadowbox image")
 
-uploaded = st.file_uploader(
-    "Choose an image",
-    type=["jpg", "jpeg", "png", "bmp"]
+image_source = st.radio(
+    "Choose how to provide the shadowbox image",
+    ["USB camera", "Upload image"],
+    horizontal=True,
+    key="image_source_choice"
 )
 
-if uploaded:
-    try:
-        original = read_image(uploaded)
-    except Exception as exc:
-        st.error(str(exc))
-        st.stop()
+uploaded = None
+original = None
+current_id = None
 
-    current_id = f"{uploaded.name}:{uploaded.size}"
+if image_source == "USB camera":
+    st.caption(
+        "Connect the ELP camera to this laptop by USB. The camera is accessed "
+        "as a local camera device, not by browsing to a file or folder."
+    )
 
+    if st.session_state.captured_camera_image is None:
+        camera_col1, camera_col2 = st.columns([1, 1])
+
+        with camera_col1:
+            if st.session_state.usb_camera is None:
+                if st.button("Start live camera", type="primary"):
+                    try:
+                        st.session_state.usb_camera = open_usb_camera(CAMERA_INDEX)
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(str(exc))
+            else:
+                st.success(f"Camera connected (device index {CAMERA_INDEX}).")
+
+        with camera_col2:
+            if st.session_state.usb_camera is not None:
+                if st.button("Stop camera"):
+                    release_usb_camera()
+                    st.rerun()
+
+        if st.session_state.usb_camera is not None:
+            live_camera_preview()
+        else:
+            st.info(
+                "Press **Start live camera** to view the ELP camera. "
+                "If it does not connect, change CAMERA_INDEX near the top of the code."
+            )
+    else:
+        original = st.session_state.captured_camera_image
+        current_id = f"camera:{st.session_state.captured_camera_id}"
+        st.success("Photograph captured and loaded into Tool Profiling.")
+        if st.button("Retake photograph"):
+            st.session_state.captured_camera_image = None
+            st.session_state.captured_camera_id = None
+            st.rerun()
+
+else:
+    # Release the USB camera if the user switches to manual upload.
+    if st.session_state.usb_camera is not None:
+        release_usb_camera()
+
+    uploaded = st.file_uploader(
+        "Choose a shadowbox image",
+        type=["jpg", "jpeg", "png", "bmp"]
+    )
+
+    if uploaded is not None:
+        try:
+            original = read_image(uploaded)
+            current_id = f"upload:{uploaded.name}:{uploaded.size}"
+        except Exception as exc:
+            st.error(str(exc))
+            st.stop()
+
+if original is not None:
     if st.session_state.upload_id != current_id:
         st.session_state.upload_id = current_id
         st.session_state.processed = None
         st.session_state.pop("tool_names", None)
         st.session_state.pop("names_for", None)
-        st.session_state.pop("rejected", None)
+        st.session_state.pop("rejected_tools", None)
 
     st.write("Selected Image")
     st.image(
@@ -519,7 +754,8 @@ if uploaded:
     st.subheader("3. Detect, Crop and Calibrate the lightbed")
 
     st.write(
-        " "
+        "The application will search for the rectangular lightbed border, "
+        "correct the photograph's perspective and crop everything outside the bed."
     )
 
     if st.button("Detect lightbed and calibrate", type="primary"):
@@ -552,7 +788,7 @@ if uploaded:
                         "scale": scale,
                         "bed_width_mm": bed_width_mm,
                         "bed_height_mm": bed_height_mm,
-                        "image_name": Path(uploaded.name).stem,
+                        "image_name": Path(uploaded.name).stem if uploaded is not None else "Camera_Capture",
                         "upload_id": current_id
                     }
 
@@ -571,7 +807,7 @@ if uploaded:
 
         st.success("Lightbed detected and image automatically calibrated.")
 
-        st.write("Lightbed detection")
+        st.write("Lightbed detection (greyscale, with approximately 10 mm of background around the bed)")
         detection_preview = draw_bed_detection(
             original,
             result["corners"],
@@ -637,7 +873,9 @@ if uploaded:
                     for contour in raw_contours
                 ]
 
-                st.session_state.pop("rejected", None)
+                st.session_state.pop("rejected_tools", None)
+                st.session_state.pop("tool_names", None)
+                st.session_state.pop("names_for", None)
 
                 st.session_state.processed.update({
                     "contours": contours,
@@ -664,12 +902,11 @@ if uploaded:
                     "No tools were detected. Try lowering the minimum contour "
                     "area or adjusting the image threshold."
                 )
-
             else:
                 st.success(
-                    f"Detected {len(contours)} tool(s). "
-                    "Check that the red generated outlines follow the "
-                    "physical outline of the tools."
+                    f"Detected {len(contours)} candidate tool(s). "
+                    "Check that each red outline follows a tool. You can reject "
+                    "unwanted outlines below."
                 )
 
                 if (
@@ -677,20 +914,17 @@ if uploaded:
                     or st.session_state.get("names_for") != current_id
                     or len(st.session_state.tool_names) != len(contours)
                 ):
-                    # None means "use the default name for its position".
                     st.session_state.tool_names = [None] * len(contours)
                     st.session_state.names_for = current_id
 
-                # Indices of tools the user has rejected with the X button.
-                rejected = st.session_state.setdefault("rejected", set())
-                kept = [i for i in range(len(contours)) if i not in rejected]
+                rejected = set(st.session_state.get("rejected_tools", set()))
+                kept_indices = [i for i in range(len(contours)) if i not in rejected]
 
-                # Display the labelled image before asking the user to name
-                # each detected tool.
+                # First show a numbered image of the outlines still being kept.
                 preview = annotate_image(
                     corrected,
-                    [contours[i] for i in kept],
-                    [f"Tool_{pos + 1}" for pos in range(len(kept))]
+                    [contours[i] for i in kept_indices],
+                    [f"Tool_{position + 1}" for position in range(len(kept_indices))]
                 )
 
                 st.subheader("Labelled image")
@@ -703,96 +937,130 @@ if uploaded:
                     width=DISPLAY_MAX_WIDTH
                 )
 
-                st.subheader("Name your tools")
-                naming_columns = st.columns(2)
+                st.subheader("Keep, reject or restore outlines")
+                if not kept_indices:
+                    st.warning("All detected outlines have been rejected. Restore at least one tool to export DXF files.")
 
-                for position, index in enumerate(kept):
+                for position, index in enumerate(kept_indices):
                     default_name = f"Tool_{position + 1}"
-
-                    with naming_columns[position % 2]:
-                        name_col, x_col = st.columns(
-                            [6, 1],
-                            vertical_alignment="bottom"
+                    name_col, offset_col, reject_col = st.columns(
+                        [4, 2, 1],
+                        vertical_alignment="bottom"
+                    )
+                    with name_col:
+                        entered_name = st.text_input(
+                            f"Name for Tool {position + 1}",
+                            value=st.session_state.tool_names[index] or default_name,
+                            key=f"tool_name_{current_id}_{index}_{position}"
+                        )
+                        st.session_state.tool_names[index] = (
+                            None if entered_name == default_name else entered_name
+                        )
+                    with offset_col:
+                        st.number_input(
+                            "Outline offset (mm)",
+                            min_value=-20.0,
+                            max_value=20.0,
+                            value=0.0,
+                            step=0.1,
+                            format="%.1f",
+                            key=f"tool_offset_{current_id}_{index}"
+                        )
+                    with reject_col:
+                        st.button(
+                            "Reject",
+                            key=f"reject_tool_{current_id}_{index}",
+                            help="Exclude this outline from the preview and all DXF exports",
+                            on_click=reject_detected_tool,
+                            args=(index,)
                         )
 
-                        with name_col:
-                            entered = st.text_input(
-                                f"Tool {position + 1}",
-                                value=st.session_state.tool_names[index] or default_name,
-                                key=f"name_{current_id}_{index}_{position}"
-                            )
+                rejected = set(st.session_state.get("rejected_tools", set()))
+                if rejected:
+                    with st.expander(f"Rejected outlines ({len(rejected)}) — restore if needed"):
+                        for index in sorted(rejected):
+                            restore_col, action_col = st.columns([5, 1])
+                            with restore_col:
+                                st.write(f"Detected outline {index + 1}")
+                            with action_col:
+                                st.button(
+                                    "Restore",
+                                    key=f"restore_tool_{current_id}_{index}",
+                                    on_click=restore_detected_tool,
+                                    args=(index,)
+                                )
 
-                            # Only keep names the user actually changed, so
-                            # untouched tools renumber when one is removed.
-                            st.session_state.tool_names[index] = (
-                                None if entered == default_name else entered
-                            )
-
-                        with x_col:
-                            st.button(
-                                "❌",
-                                key=f"reject_{current_id}_{index}",
-                                help="Remove this outline",
-                                on_click=rejected.add,
-                                args=(index,)
-                            )
-
+                # Re-read the rejected list after the controls have been rendered.
+                rejected = set(st.session_state.get("rejected_tools", set()))
+                kept_indices = [i for i in range(len(contours)) if i not in rejected]
+                kept_contours = [contours[i] for i in kept_indices]
                 names = [
-                    (st.session_state.tool_names[i] or "").strip()
+                    (st.session_state.tool_names[i] or f"Tool_{position + 1}").strip()
                     or f"Tool_{position + 1}"
-                    for position, i in enumerate(kept)
+                    for position, i in enumerate(kept_indices)
                 ]
-                kept_contours = [contours[i] for i in kept]
 
-                # Refresh the labels using the names entered above. This
-                # remains the image used for the final download.
-                preview = annotate_image(
-                    corrected,
-                    kept_contours,
-                    names
-                )
+                offsets_mm = [
+                    float(st.session_state.get(f"tool_offset_{current_id}_{i}", 0.0))
+                    for i in kept_indices
+                ]
+                adjusted_contours = [
+                    offset_contour(contour, offset_mm, scale)
+                    for contour, offset_mm in zip(kept_contours, offsets_mm)
+                ]
+
+                # This is the final named preview and is also the image downloaded.
+                preview = annotate_image(corrected, adjusted_contours, names)
 
                 st.subheader("6. Export files")
 
-                col1, col2, col3 = st.columns(3)
+                if not kept_contours:
+                    st.info("Restore or keep at least one outline before exporting.")
+                else:
+                    col1, col2, col3 = st.columns(3)
 
-                with col1:
-                    st.download_button(
-                        "Download combined DXF",
-                        data=make_dxf(kept_contours, names, scale),
-                        file_name=f"{image_name}_entire_bed.dxf",
-                        mime="application/dxf",
-                        use_container_width=True
-                    )
-
-                with col2:
-                    st.download_button(
-                        "Download individual DXFs (ZIP)",
-                        data=make_zip(kept_contours, names, scale),
-                        file_name=f"{image_name}_individual_tools.zip",
-                        mime="application/zip",
-                        use_container_width=True
-                    )
-
-                with col3:
-                    success, encoded = cv2.imencode(".jpg", preview)
-
-                    if success:
+                    with col1:
                         st.download_button(
-                            "Download contoured image",
-                            data=encoded.tobytes(),
-                            file_name=f"{image_name}_Contoured.jpg",
-                            mime="image/jpeg",
+                            "Download combined DXF",
+                            data=make_dxf(adjusted_contours, names, scale),
+                            file_name=f"{image_name}_entire_bed.dxf",
+                            mime="application/dxf",
                             use_container_width=True
                         )
 
+                    with col2:
+                        st.download_button(
+                            "Download individual DXFs (ZIP)",
+                            data=make_zip(adjusted_contours, names, scale),
+                            file_name=f"{image_name}_individual_tools.zip",
+                            mime="application/zip",
+                            use_container_width=True
+                        )
+
+                    with col3:
+                        success, encoded = cv2.imencode(".jpg", preview)
+
+                        if success:
+                            st.download_button(
+                                "Download contoured image",
+                                data=encoded.tobytes(),
+                                file_name=f"{image_name}_Contoured.jpg",
+                                mime="image/jpeg",
+                                use_container_width=True
+                            )
+
                 st.caption(
                     "Downloads are generated by the browser. "
+                    "The app does not write to your laptop's original folders."
                 )
 
 
 st.divider()
 st.caption(
-    "Inspect the detected boundary and DXF outlines before using "
+    "The lightbed detection and final contoured preview are displayed in greyscale "
+    "with coloured boundary/contour overlays. The automatically corrected working "
+    "image is kept behind the scenes for calibration and DXF generation. "
+    "Automatic bed detection depends on the lightbed border being visible. "
+    "Always inspect the detected boundary and DXF outlines before using "
     "the exported files for machining."
 )
