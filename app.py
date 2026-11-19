@@ -1,5 +1,6 @@
 import io
 import os
+import threading
 import uuid
 import zipfile
 from pathlib import Path
@@ -9,6 +10,7 @@ import ezdxf
 import numpy as np
 import streamlit as st
 from PIL import Image
+from streamlit_webrtc import webrtc_streamer
 
 
 # ------------------------------------------------------------
@@ -19,7 +21,7 @@ st.set_page_config(page_title="Tool Profiling", page_icon="🛠️", layout="wid
 
 st.title("🛠️ Tool Profiling")
 st.caption(
-    "Capture a shadowbox photograph using a connected USB camera, or upload an image, "
+    "Capture a shadowbox photograph using a browser-connected camera, or upload an image, "
     "to generate individual tool DXFs."
 )
 
@@ -37,7 +39,7 @@ LIGHTBED_PREVIEW_HEIGHT = 560
 # CAMERA_INDEX is the camera device number, NOT a folder/file path.
 # Usually 0 = first camera, 1 = second camera, 2 = third camera, etc.
 # If the laptop's built-in webcam is index 0, the ELP camera may be index 1.
-CAMERA_INDEX = 1  # EDIT THIS VALUE if the ELP camera is a different index.
+CAMERA_INDEX = 0  # EDIT THIS VALUE if the ELP camera is a different index.
 
 # These are the requested still-image dimensions for the ELP 16MP camera.
 # The camera/driver may choose a different supported resolution; the app
@@ -154,6 +156,23 @@ def live_camera_preview():
         st.session_state.captured_camera_id = uuid.uuid4().hex[:12]
         release_usb_camera()
         st.rerun(scope="app")
+
+
+def make_browser_camera_callback(frame_buffer, frame_lock):
+    """
+    Build a thread-safe callback that stores the latest browser camera frame.
+
+    The camera is opened by the user's browser through WebRTC. The Python
+    server receives the frames; it does not try to access a USB device
+    physically connected to the server.
+    """
+    def video_frame_callback(frame):
+        image = frame.to_ndarray(format="bgr24")
+        with frame_lock:
+            frame_buffer["frame"] = image
+        return frame
+
+    return video_frame_callback
 
 
 # ------------------------------------------------------------
@@ -628,6 +647,12 @@ if "captured_camera_image" not in st.session_state:
 if "captured_camera_id" not in st.session_state:
     st.session_state.captured_camera_id = None
 
+if "browser_camera_frame_buffer" not in st.session_state:
+    st.session_state.browser_camera_frame_buffer = {"frame": None}
+
+if "browser_camera_frame_lock" not in st.session_state:
+    st.session_state.browser_camera_frame_lock = threading.Lock()
+
 
 # ------------------------------------------------------------
 # User interface
@@ -639,7 +664,7 @@ st.subheader("1. Capture or upload your shadowbox image")
 
 image_source = st.radio(
     "Choose how to provide the shadowbox image",
-    ["USB camera", "Upload image"],
+    ["Browser camera", "Upload image"],
     horizontal=True,
     key="image_source_choice"
 )
@@ -648,53 +673,93 @@ uploaded = None
 original = None
 current_id = None
 
-if image_source == "USB camera":
+if image_source == "Browser camera":
     st.caption(
-        "Connect the ELP camera to this laptop by USB. The camera is accessed "
-        "as a local camera device, not by browsing to a file or folder."
+        "Connect the ELP camera to the device running this browser. "
+        "Press START in the camera panel and allow camera access when your "
+        "browser asks for permission. The browser sends the live camera frames "
+        "to this application for capture and processing."
     )
 
     if st.session_state.captured_camera_image is None:
-        camera_col1, camera_col2 = st.columns([1, 1])
+        camera_frame_buffer = st.session_state.browser_camera_frame_buffer
+        camera_frame_lock = st.session_state.browser_camera_frame_lock
 
-        with camera_col1:
-            if st.session_state.usb_camera is None:
-                if st.button("Start live camera", type="primary"):
-                    try:
-                        st.session_state.usb_camera = open_usb_camera(CAMERA_INDEX)
-                        st.rerun()
-                    except Exception as exc:
-                        st.error(str(exc))
-            else:
-                st.success(f"Camera connected (device index {CAMERA_INDEX}).")
+        camera_ctx = webrtc_streamer(
+            key="tool_profiling_browser_camera",
+            video_frame_callback=make_browser_camera_callback(
+                camera_frame_buffer,
+                camera_frame_lock
+            ),
+            media_stream_constraints={
+                "video": {
+                    "width": {"ideal": CAMERA_REQUESTED_WIDTH},
+                    "height": {"ideal": CAMERA_REQUESTED_HEIGHT},
+                    "frameRate": {"ideal": 5, "max": 10}
+                },
+                "audio": False
+            },
+            rtc_configuration={
+                "iceServers": [
+                    {"urls": ["stun:stun.l.google.com:19302"]}
+                ]
+            },
+            async_processing=False
+        )
 
-        with camera_col2:
-            if st.session_state.usb_camera is not None:
-                if st.button("Stop camera"):
-                    release_usb_camera()
+        if camera_ctx.state.playing:
+            st.success("Browser camera connected. Check the live preview before capturing.")
+            if st.button(
+                "Capture photograph",
+                type="primary",
+                key="capture_browser_camera"
+            ):
+                with camera_frame_lock:
+                    frame = camera_frame_buffer.get("frame")
+                    captured_frame = frame.copy() if frame is not None else None
+
+                if captured_frame is None:
+                    st.warning(
+                        "The camera has started, but no frame has arrived yet. "
+                        "Wait a moment and try capturing again."
+                    )
+                else:
+                    st.session_state.captured_camera_image = captured_frame
+                    st.session_state.captured_camera_id = uuid.uuid4().hex[:12]
                     st.rerun()
-
-        if st.session_state.usb_camera is not None:
-            live_camera_preview()
         else:
             st.info(
-                "Press **Start live camera** to view the ELP camera. "
-                "If it does not connect, change CAMERA_INDEX near the top of the code."
+                "Select **START** in the camera panel. Your browser should then "
+                "ask permission to use a camera. If permission was previously "
+                "denied, allow it in the browser's site settings and reload."
             )
     else:
         original = st.session_state.captured_camera_image
         current_id = f"camera:{st.session_state.captured_camera_id}"
-        st.success("Photograph captured and loaded into Tool Profiling.")
+        captured_height, captured_width = original.shape[:2]
+        st.success(
+            f"Photograph captured and loaded into Tool Profiling "
+            f"({captured_width} × {captured_height} pixels)."
+        )
+        if (captured_width, captured_height) != (
+            CAMERA_REQUESTED_WIDTH,
+            CAMERA_REQUESTED_HEIGHT
+        ):
+            st.warning(
+                "The browser camera stream did not provide the requested "
+                f"{CAMERA_REQUESTED_WIDTH} × {CAMERA_REQUESTED_HEIGHT} resolution. "
+                "The camera/browser/WebRTC connection has supplied "
+                f"{captured_width} × {captured_height} pixels instead. "
+                "Check the captured image carefully before relying on small "
+                "tool details for machining."
+            )
         if st.button("Retake photograph"):
             st.session_state.captured_camera_image = None
             st.session_state.captured_camera_id = None
+            st.session_state.browser_camera_frame_buffer["frame"] = None
             st.rerun()
 
 else:
-    # Release the USB camera if the user switches to manual upload.
-    if st.session_state.usb_camera is not None:
-        release_usb_camera()
-
     uploaded = st.file_uploader(
         "Choose a shadowbox image",
         type=["jpg", "jpeg", "png", "bmp"]
